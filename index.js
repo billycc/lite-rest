@@ -9,76 +9,116 @@
 var sql = require('sqlite3').verbose();
 var _ = require('lodash');
 
-var myget = function(req, res, next) {
+var myget = function(db, tbl, req, res) {
     var qry = 'select * from ' + tbl + ' ';
     if (req.params && req.params.id) {
-    	// this IF is for grabbing a specific item from the collection,
-    	// with a url like: /path/to/collection/:id
+        // this IF is for grabbing a specific item from the collection,
+        // with a url like: /path/to/collection/:id
+
         qry += " where id = ? ";
-        db.get(qry, req.params.id, function(err, rows) {
+        db.all(qry, req.params.id, function(err, rows) {
             if (err) {
-                res.json(500, err);
+                res.status(500).json(err);
             } else {
                 if (rows && rows.length === 1) {
                     res.json(rows[0]);
                 } else {
-                    res.json(404, rows);
+                    res.status(404).json(rows);
                 }
             }
         });
     } else {
-    	// for grabbing the whole collection
-    	db.get(qry, function(err, rows) {
-    		if (err) {
-    			res.json(500, err);
-    		} else{
-    			res.json(rows);
-    		}
-    	});
+        // for grabbing the whole collection
+        db.all(qry, function(err, rows) {
+            if (err) {
+                res.status(500).json(err);
+            } else {
+                res.json(rows);
+            }
+        });
     }
 };
 
-var mycreate = function(obj, res, next) {
+var mycreate = function(db, tbl, obj, res) {
     var creater = [];
     var columns = [];
     var values = [];
     var quests = [];
-    _.forEach(obj, function(k) {
-        creater.push(" " + k + " text ");
-        columns.push(k);
-        values.push(obj[k]);
-        quests.push('?');
+    var keys = [];
+    var keyvals = {};
+    var kvs = [];
+
+    _.forEach(obj, function(k, j) {
+        creater.push(" " + j + " text ");
+        columns.push(j);
+
+        keys.push('$' + j);
+        keyvals['$' + j] = k;
+
+        if (j !== 'id') {
+            kvs.push(j + ' = $' + j);
+        }
     });
 
     db.serialize(function() {
-    	// if this is the 1st item in the collection
+        // if this is the 1st item in the collection
         var qry = "CREATE TABLE IF NOT EXISTS " + tbl + " ( " + creater.join(',') + " )";
         db.run(qry);
 
+        var docreate = true;
+
         if (obj.id) {
-        	// rather than a more awkward update query generation, we'll drop and then re-add a record.
-            qry = "DELETE FROM " + tbl + " WHERE id = ? ";
-            db.run(qry, obj.id);
+            qry = "SELECT id FROM " + tbl + " WHERE id = ?";
+            db.all(qry, obj.id, function(err, rows) {
+                if (err) {
+                    res.status(500).json(err);
+                } else {
+                    docreate = rows.length !== 1;
+                }
+            });
+
+            if (!docreate) {
+                // if we have the id, we'll run an update instead of an insert
+                qry = "UPDATE " + tbl + " SET " + kvs.join(', ') + " WHERE id = $id";
+                db.run(qry, keyvals, function(err) {
+                    if (err) {
+                        res.status(500).json(err);
+                    } else {
+                        res.json(obj);
+                    }
+                });
+            }
         }
 
-        // insert into tbl (col1, col2) values(?, ?)
-        qry = "INSERT INTO " + tbl + " ( " + columns.join(',') + " ) VALUES ( " + quests.join(',') + " )";
-        var args = [qry].concat(values);
-        args.push(function(err, rows) {
-            if (err) {
-                res.json(500, err);
-            } else {
-                res.json(201, obj);
-            }
-        });
+        if (docreate) {
+            // insert into tbl (col1, col2) values(?, ?)
+            qry = "INSERT INTO " + tbl + " ( " + columns.join(',') + " ) VALUES ( " + keys.join(',') + " )";
+            db.run(qry, keyvals, function(err, rows) {
+                if (err) {
+                    res.status(500).json(err);
+                } else {
+                    res.status(201).json(obj);
+                }
+            });
 
-        // the semi-awkwardness of the args var is because db.run() takes a variable # of args, 
-        // with the 1st being the string query, the middles are ?-param replacers, last is a callback fn
-        db.run.apply(db, args);
+        }
     });
 };
 
-var restTable = function(db, tbl) {
+var mydelete = function(db, tbl, id, res) {
+    db.serialize(function() {
+        var qry = "DELETE FROM " + tbl + " WHERE id = ? ";
+        db.run(qry, id, function(err) {
+            if (err) {
+                res.status(500).json(err);
+            } else {
+                res.status(204).end();
+            }
+        });
+    });
+};
+
+var liteRest = function(db, tbl) {
     if (typeof tbl !== 'string') {
         throw 'bad tbl type. should be string. found: ' + typeof tbl;
     }
@@ -88,15 +128,21 @@ var restTable = function(db, tbl) {
     }
 
     return function(req, res, next) {
-        if (req.method === 'get') {
-            myget(req, res, next);
-        } else if (req.method === 'post') {
-            mycreate(req.body, res, next);
-        } else if (req.method === 'put') {
-        	var x = _.extend({}, req.body, {id: req.params.id});
-        	mycreate(x, res, next);
+        if (req.method === 'GET') {
+            myget(db, tbl, req, res);
+        } else if (req.method === 'POST') {
+            mycreate(db, tbl, req.body, res);
+        } else if (req.method === 'PUT') {
+            var x = _.extend({}, req.body, {
+                id: req.params.id
+            });
+            mycreate(db, tbl, x, res);
+        } else if (req.method === 'DELETE') {
+            mydelete(db, tbl, req.params.id, res);
+        } else {
+            next();
         }
     };
 };
 
-module.exports = restTable;
+module.exports = liteRest;
